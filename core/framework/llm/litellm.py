@@ -159,6 +159,26 @@ if litellm is not None:
     # (e.g. stream_options for Anthropic) instead of forwarding them verbatim.
     litellm.drop_params = True
 
+
+def _is_ollama_model(model: str) -> bool:
+    """Return True for any Ollama model string (ollama/ or ollama_chat/ prefix)."""
+    return model.startswith("ollama/") or model.startswith("ollama_chat/")
+
+
+def _ensure_ollama_chat_prefix(model: str) -> str:
+    """Normalise Ollama model strings to use the ollama_chat/ prefix.
+
+    LiteLLM requires the ``ollama_chat/`` prefix (not ``ollama/``) to enable
+    native function-calling support.  With ``ollama/``, LiteLLM falls back to
+    JSON-mode tool calls, which the framework cannot parse as real tool calls.
+
+    See: https://docs.litellm.ai/docs/providers/ollama#example-usage---tool-calling
+    """
+    if model.startswith("ollama/"):
+        return "ollama_chat/" + model[len("ollama/") :]
+    return model
+
+
 RATE_LIMIT_MAX_RETRIES = 10
 RATE_LIMIT_BACKOFF_BASE = 2  # seconds
 RATE_LIMIT_MAX_DELAY = 120  # seconds - cap to prevent absurd waits
@@ -252,6 +272,10 @@ OPENROUTER_TOOL_COMPAT_CACHE_TTL_SECONDS = 3600
 # OpenRouter routing can change over time, so tool-compat caching must expire.
 OPENROUTER_TOOL_COMPAT_MODEL_CACHE: dict[str, float] = {}
 
+# Transient stream errors (network blips, timeouts) use a separate cap
+# from rate-limit retries — 3 retries is sufficient for connection failures.
+STREAM_TRANSIENT_MAX_RETRIES = 3
+
 # Directory for dumping failed requests
 FAILED_REQUESTS_DIR = Path.home() / ".hive" / "failed_requests"
 
@@ -318,34 +342,38 @@ def _dump_failed_request(
     attempt: int,
 ) -> str:
     """Dump failed request to a file for debugging. Returns the file path."""
-    FAILED_REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        FAILED_REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    filename = f"{error_type}_{model.replace('/', '_')}_{timestamp}.json"
-    filepath = FAILED_REQUESTS_DIR / filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"{error_type}_{model.replace('/', '_')}_{timestamp}.json"
+        filepath = FAILED_REQUESTS_DIR / filename
 
-    # Build dump data
-    messages = kwargs.get("messages", [])
-    dump_data = {
-        "timestamp": datetime.now().isoformat(),
-        "model": model,
-        "error_type": error_type,
-        "attempt": attempt,
-        "estimated_tokens": _estimate_tokens(model, messages),
-        "num_messages": len(messages),
-        "messages": messages,
-        "tools": kwargs.get("tools"),
-        "max_tokens": kwargs.get("max_tokens"),
-        "temperature": kwargs.get("temperature"),
-    }
+        # Build dump data
+        messages = kwargs.get("messages", [])
+        dump_data = {
+            "timestamp": datetime.now().isoformat(),
+            "model": model,
+            "error_type": error_type,
+            "attempt": attempt,
+            "estimated_tokens": _estimate_tokens(model, messages),
+            "num_messages": len(messages),
+            "messages": messages,
+            "tools": kwargs.get("tools"),
+            "max_tokens": kwargs.get("max_tokens"),
+            "temperature": kwargs.get("temperature"),
+        }
 
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(dump_data, f, indent=2, default=str)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(dump_data, f, indent=2, default=str)
 
-    # Prune old dumps to prevent unbounded disk growth
-    _prune_failed_request_dumps()
+        # Prune old dumps to prevent unbounded disk growth
+        _prune_failed_request_dumps()
 
-    return str(filepath)
+        return str(filepath)
+    except OSError as e:
+        logger.warning(f"Failed to dump request debug log to {FAILED_REQUESTS_DIR}: {e}")
+        return "log_write_failed"
 
 
 def _compute_retry_delay(
@@ -438,6 +466,59 @@ def _is_stream_transient_error(exc: BaseException) -> bool:
     return isinstance(exc, transient_types)
 
 
+def _extract_text_tool_calls(
+    text: str,
+) -> tuple[list, str]:
+    """Extract hallucinated tool calls from ``<tool_code>`` blocks in LLM text.
+
+    Some models (notably Gemini) emit tool invocations as text instead of using
+    the structured function-calling API.  This function parses those blocks and
+    returns ``(tool_call_events, cleaned_text)`` where *cleaned_text* has the
+    ``<tool_code>`` blocks removed.
+
+    Expected format::
+
+        <tool_code>
+        {
+          "tool_name": { ...args }
+        }
+        </tool_code>
+    """
+    from framework.llm.stream_events import ToolCallEvent
+
+    pattern = re.compile(r"<tool_code>\s*(.*?)\s*</tool_code>", re.DOTALL)
+    events: list[ToolCallEvent] = []
+    cleaned = text
+
+    for match in pattern.finditer(text):
+        raw = match.group(1).strip()
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("[_extract_text_tool_calls] failed to parse JSON: %s", raw[:200])
+            continue
+
+        if not isinstance(payload, dict):
+            continue
+
+        for tool_name, tool_args in payload.items():
+            key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
+            digest = hashlib.md5(key.encode()).hexdigest()[:12]
+            call_id = f"synth_{digest}"
+            events.append(
+                ToolCallEvent(
+                    tool_use_id=call_id,
+                    tool_name=tool_name,
+                    tool_input=tool_args if isinstance(tool_args, dict) else {},
+                )
+            )
+
+    if events:
+        cleaned = pattern.sub("", text).strip()
+
+    return events, cleaned
+
+
 class LiteLLMProvider(LLMProvider):
     """
     LiteLLM-based LLM provider for multi-provider support.
@@ -499,7 +580,9 @@ class LiteLLMProvider(LLMProvider):
         # Translate kimi/ prefix to anthropic/ so litellm uses the Anthropic
         # Messages API handler and routes to that endpoint — no special headers needed.
         _original_model = model
-        if model.lower().startswith("kimi/"):
+        if _is_ollama_model(model):
+            model = _ensure_ollama_chat_prefix(model)
+        elif model.lower().startswith("kimi/"):
             model = "anthropic/" + model[len("kimi/") :]
             # Normalise api_base: litellm's Anthropic handler appends /v1/messages,
             # so the base must be https://api.kimi.com/coding (no /v1 suffix).
@@ -525,6 +608,8 @@ class LiteLLMProvider(LLMProvider):
         self._codex_backend = bool(
             self.api_base and "chatgpt.com/backend-api/codex" in self.api_base
         )
+        # Antigravity routes through a local OpenAI-compatible proxy — no patches needed.
+        self._antigravity = bool(self.api_base and "localhost:8069" in self.api_base)
 
         if litellm is None:
             raise ImportError(
@@ -720,6 +805,10 @@ class LiteLLMProvider(LLMProvider):
         # Add tools if provided
         if tools:
             kwargs["tools"] = [self._tool_to_openai_format(t) for t in tools]
+            if _is_ollama_model(self.model):
+                # Ollama requires explicit tool_choice=auto for function calling
+                # so future readers don't have to guess.
+                kwargs.setdefault("tool_choice", "auto")
 
         # Add response_format for structured output
         # LiteLLM passes this through to the underlying provider
@@ -917,6 +1006,10 @@ class LiteLLMProvider(LLMProvider):
             kwargs["api_base"] = self.api_base
         if tools:
             kwargs["tools"] = [self._tool_to_openai_format(t) for t in tools]
+            if _is_ollama_model(self.model):
+                # Ollama requires explicit tool_choice=auto for function calling
+                # so future readers don't have to guess.
+                kwargs.setdefault("tool_choice", "auto")
         if response_format:
             kwargs["response_format"] = response_format
 
@@ -1618,6 +1711,10 @@ class LiteLLMProvider(LLMProvider):
             kwargs["api_base"] = self.api_base
         if tools:
             kwargs["tools"] = [self._tool_to_openai_format(t) for t in tools]
+            if _is_ollama_model(self.model):
+                # Ollama requires explicit tool_choice=auto for function calling
+                # so future readers don't have to guess.
+                kwargs.setdefault("tool_choice", "auto")
         if response_format:
             kwargs["response_format"] = response_format
         # The Codex ChatGPT backend (Responses API) rejects several params.
@@ -1715,6 +1812,10 @@ class LiteLLMProvider(LLMProvider):
 
                     # --- Finish ---
                     if choice.finish_reason:
+                        # Kimi's 'pause_turn' means the model emitted tool
+                        # calls and expects results — equivalent to 'tool_calls'.
+                        if choice.finish_reason == "pause_turn":
+                            choice.finish_reason = "tool_calls" if tool_calls_acc else "stop"
                         stream_finish_reason = choice.finish_reason
                         for _idx, tc_data in sorted(tool_calls_acc.items()):
                             parsed_args = self._parse_tool_call_arguments(
@@ -1882,6 +1983,39 @@ class LiteLLMProvider(LLMProvider):
                         f"(last_role={last_role}). Returning empty result."
                     )
 
+                # Gemini sometimes outputs tool calls as text in
+                # <tool_code>{"name": {...args}}</tool_code> blocks
+                # instead of using the function-calling API.  Extract
+                # these as real ToolCallEvents and strip them from the
+                # text so the rest of the system treats them normally.
+                if accumulated_text and "<tool_code>" in accumulated_text:
+                    extracted, cleaned = _extract_text_tool_calls(accumulated_text)
+                    if extracted:
+                        tool_names = [tc.tool_name for tc in extracted]
+                        logger.info(
+                            "[stream] Model emitted %d tool call(s) as <tool_code> text "
+                            "instead of structured function calls; converting to "
+                            "synthetic ToolCallEvents: %s",
+                            len(extracted),
+                            tool_names,
+                        )
+                        accumulated_text = cleaned
+                        # Emit a corrected TextDeltaEvent so the caller's
+                        # accumulated_text is overwritten with the cleaned text.
+                        yield TextDeltaEvent(content="", snapshot=cleaned)
+                        # Insert synthetic ToolCallEvents before FinishEvent.
+                        finish_idx = next(
+                            (i for i, ev in enumerate(tail_events) if isinstance(ev, FinishEvent)),
+                            len(tail_events),
+                        )
+                        for tc_ev in reversed(extracted):
+                            tail_events.insert(finish_idx, tc_ev)
+                        # Update TextEndEvent if present.
+                        for _i, _ev in enumerate(tail_events):
+                            if isinstance(_ev, TextEndEvent):
+                                tail_events[_i] = TextEndEvent(full_text=cleaned)
+                                break
+
                 # Success (or empty after exhausted retries) — flush events.
                 for event in tail_events:
                     yield event
@@ -1901,6 +2035,36 @@ class LiteLLMProvider(LLMProvider):
                 return
 
             except Exception as e:
+                # Some providers return non-standard finish_reason values
+                # (e.g., kimi-k2.5 sends 'pause_turn') that LiteLLM's
+                # internal stream_chunk_builder rejects via Pydantic
+                # validation.  If we already accumulated content and built
+                # tail_events before the error, the stream was successful —
+                # yield what we have instead of discarding it.
+                if (accumulated_text or tool_calls_acc) and tail_events:
+                    # LiteLLM may wrap the original ValidationError in an
+                    # APIError with a different message.  Check the full
+                    # exception chain (str(e) + str(__cause__)).
+                    _err_chain = f"{e} {e.__cause__}" if e.__cause__ else str(e)
+                    _is_finish_reason_err = (
+                        "finish_reason" in _err_chain and "validation error" in _err_chain.lower()
+                    ) or (
+                        # Fallback: the APIError wrapper message for chunk-building failures
+                        "building chunks" in str(e).lower() and (accumulated_text or tool_calls_acc)
+                    )
+                    if _is_finish_reason_err:
+                        logger.warning(
+                            "[stream] %s: LiteLLM finish_reason validation "
+                            "error (non-standard provider value). "
+                            "Content was streamed successfully — "
+                            "using accumulated result. Error: %s",
+                            self.model,
+                            e,
+                        )
+                        for event in tail_events:
+                            yield event
+                        return
+
                 if self._should_use_openrouter_tool_compat(e, tools):
                     _remember_openrouter_tool_compat_model(self.model)
                     async for event in self._stream_via_openrouter_tool_compat(
@@ -1911,13 +2075,13 @@ class LiteLLMProvider(LLMProvider):
                     ):
                         yield event
                     return
-                if _is_stream_transient_error(e) and attempt < RATE_LIMIT_MAX_RETRIES:
+                if _is_stream_transient_error(e) and attempt < STREAM_TRANSIENT_MAX_RETRIES:
                     wait = _compute_retry_delay(attempt, exception=e)
                     logger.warning(
                         f"[stream-retry] {self.model} transient error "
                         f"({type(e).__name__}): {e!s}. "
                         f"Retrying in {wait:.1f}s "
-                        f"(attempt {attempt + 1}/{RATE_LIMIT_MAX_RETRIES})"
+                        f"(attempt {attempt + 1}/{STREAM_TRANSIENT_MAX_RETRIES})"
                     )
                     await asyncio.sleep(wait)
                     continue

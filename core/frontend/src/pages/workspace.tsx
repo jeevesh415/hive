@@ -1,7 +1,6 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
-import ReactDOM from "react-dom";
 import { useSearchParams, useNavigate } from "react-router-dom";
-import { Plus, KeyRound, Sparkles, Layers, ChevronLeft, Bot, Loader2, WifiOff, X } from "lucide-react";
+import { Plus, KeyRound, Loader2, WifiOff, X, FolderOpen } from "lucide-react";
 import type { GraphNode, NodeStatus } from "@/components/graph-types";
 import DraftGraph from "@/components/DraftGraph";
 import ChatPanel, { type ChatMessage } from "@/components/ChatPanel";
@@ -9,12 +8,11 @@ import TopBar from "@/components/TopBar";
 import { TAB_STORAGE_KEY, loadPersistedTabs, savePersistedTabs, type PersistedTabState } from "@/lib/tab-persistence";
 import NodeDetailPanel from "@/components/NodeDetailPanel";
 import CredentialsModal, { type Credential, createFreshCredentials, cloneCredentials, allRequiredCredentialsMet, clearCredentialCache } from "@/components/CredentialsModal";
-import { agentsApi } from "@/api/agents";
 import { executionApi } from "@/api/execution";
 import { graphsApi } from "@/api/graphs";
 import { sessionsApi } from "@/api/sessions";
 import { useMultiSSE } from "@/hooks/use-sse";
-import type { LiveSession, AgentEvent, DiscoverEntry, NodeSpec, DraftGraph as DraftGraphData } from "@/api/types";
+import type { LiveSession, AgentEvent, NodeSpec, DraftGraph as DraftGraphData } from "@/api/types";
 import { sseEventToChatMessage, formatAgentDisplayName } from "@/lib/chat-helpers";
 import { topologyToGraphNodes } from "@/lib/graph-converter";
 import { cronToLabel } from "@/lib/graphUtils";
@@ -88,152 +86,6 @@ function createSession(agentType: string, label: string, existingCredentials?: C
     graphNodes: [],
     credentials: existingCredentials ? cloneCredentials(existingCredentials) : createFreshCredentials(agentType),
   };
-}
-
-// --- NewTabPopover ---
-type PopoverStep = "root" | "new-agent-choice" | "clone-pick";
-
-interface NewTabPopoverProps {
-  open: boolean;
-  onClose: () => void;
-  anchorRef: React.RefObject<HTMLButtonElement | null>;
-  activeWorker: string;
-  discoverAgents: DiscoverEntry[];
-  onFromScratch: () => void;
-  onCloneAgent: (agentPath: string, agentName: string) => void;
-}
-
-function NewTabPopover({ open, onClose, anchorRef, discoverAgents, onFromScratch, onCloneAgent }: NewTabPopoverProps) {
-  const [step, setStep] = useState<PopoverStep>("root");
-  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => { if (open) setStep("root"); }, [open]);
-
-  // Compute position from anchor button
-  useEffect(() => {
-    if (open && anchorRef.current) {
-      const rect = anchorRef.current.getBoundingClientRect();
-      const POPUP_WIDTH = 240; // w-60 = 15rem = 240px
-      const overflows = rect.left + POPUP_WIDTH > window.innerWidth - 8;
-      console.log("Anchor rect:", rect, "Overflows:", overflows);
-setPos({
-  top: rect.bottom + 4,
-  left: overflows ? rect.right - POPUP_WIDTH : rect.left,
-});
-    }
-  }, [open, anchorRef]);
-
-  // Close on outside click
-  useEffect(() => {
-    if (!open) return;
-    const handler = (e: MouseEvent) => {
-      if (
-        ref.current && !ref.current.contains(e.target as Node) &&
-        anchorRef.current && !anchorRef.current.contains(e.target as Node)
-      ) onClose();
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [open, onClose, anchorRef]);
-
-  // Close on Escape
-  useEffect(() => {
-    if (!open) return;
-    const handler = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
-    document.addEventListener("keydown", handler);
-    return () => document.removeEventListener("keydown", handler);
-  }, [open, onClose]);
-
-  if (!open || !pos) return null;
-
-  const optionClass =
-    "flex items-center gap-3 w-full px-3 py-2.5 rounded-lg text-sm text-left transition-colors hover:bg-muted/60 text-foreground";
-  const iconWrap =
-    "w-7 h-7 rounded-md flex items-center justify-center bg-muted/80 flex-shrink-0";
-
-  return ReactDOM.createPortal(
-    <div
-      ref={ref}
-      style={{ position: "fixed", top: pos.top, left: pos.left, zIndex: 9999 }}
-      className="w-60 rounded-xl border border-border/60 bg-card shadow-xl shadow-black/30 overflow-hidden"
-    >
-      <div className="flex items-center gap-2 px-3 py-2.5 border-b border-border/40">
-        {step !== "root" && (
-          <button
-            onClick={() => setStep(step === "clone-pick" ? "new-agent-choice" : "root")}
-            className="p-0.5 rounded hover:bg-muted/60 transition-colors text-muted-foreground hover:text-foreground"
-          >
-            <ChevronLeft className="w-3.5 h-3.5" />
-          </button>
-        )}
-        <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
-          {step === "root" ? "Add Tab" : step === "new-agent-choice" ? "New Agent" : "Open Agent"}
-        </span>
-      </div>
-
-      <div className="p-1.5">
-        {step === "root" && (
-          <>
-            <button className={optionClass} onClick={() => setStep("clone-pick")}>
-              <span className={iconWrap}><Layers className="w-3.5 h-3.5 text-muted-foreground" /></span>
-              <div>
-                <div className="font-medium leading-tight">Existing agent</div>
-                <div className="text-xs text-muted-foreground mt-0.5">Open another agent's workspace</div>
-              </div>
-            </button>
-            <button className={optionClass} onClick={() => setStep("new-agent-choice")}>
-              <span className={iconWrap}><Sparkles className="w-3.5 h-3.5 text-primary" /></span>
-              <div>
-                <div className="font-medium leading-tight">New agent</div>
-                <div className="text-xs text-muted-foreground mt-0.5">Build or clone a fresh agent</div>
-              </div>
-            </button>
-          </>
-        )}
-
-        {step === "new-agent-choice" && (
-          <>
-            <button className={optionClass} onClick={() => { onFromScratch(); onClose(); }}>
-              <span className={iconWrap}><Sparkles className="w-3.5 h-3.5 text-primary" /></span>
-              <div>
-                <div className="font-medium leading-tight">From scratch</div>
-                <div className="text-xs text-muted-foreground mt-0.5">Empty pipeline + Queen Bee setup</div>
-              </div>
-            </button>
-            <button className={optionClass} onClick={() => setStep("clone-pick")}>
-              <span className={iconWrap}><Layers className="w-3.5 h-3.5 text-muted-foreground" /></span>
-              <div>
-                <div className="font-medium leading-tight">Clone existing</div>
-                <div className="text-xs text-muted-foreground mt-0.5">Start from an existing agent</div>
-              </div>
-            </button>
-          </>
-        )}
-
-        {step === "clone-pick" && (
-          <div className="flex flex-col max-h-64 overflow-y-auto">
-            {discoverAgents.map(agent => (
-              <button
-                key={agent.path}
-                onClick={() => { onCloneAgent(agent.path, agent.name); onClose(); }}
-                className="flex items-center gap-2.5 w-full px-3 py-2 rounded-lg text-left transition-colors hover:bg-muted/60 text-foreground"
-              >
-                <div className="w-6 h-6 rounded-md bg-muted/80 flex items-center justify-center flex-shrink-0">
-                  <Bot className="w-3.5 h-3.5 text-muted-foreground" />
-                </div>
-                <span className="text-sm font-medium">{agent.name}</span>
-              </button>
-            ))}
-            {discoverAgents.length === 0 && (
-              <p className="text-xs text-muted-foreground px-3 py-2">No agents found</p>
-            )}
-          </div>
-        )}
-      </div>
-    </div>,
-    document.body
-  );
 }
 
 function fmtLogTs(ts: string): string {
@@ -350,10 +202,12 @@ interface AgentBackendState {
   pendingOptions: string[] | null;
   /** Multiple questions from ask_user_multiple */
   pendingQuestions: { id: string; prompt: string; options?: string[] }[] | null;
-  /** Whether the pending question came from queen or worker */
-  pendingQuestionSource: "queen" | "worker" | null;
+  /** Whether the pending question came from the queen interaction flow */
+  pendingQuestionSource: "queen" | null;
   /** Per-node context window usage (from context_usage_updated events) */
   contextUsage: Record<string, { usagePct: number; messageCount: number; estimatedTokens: number; maxTokens: number }>;
+  /** Whether the queen's LLM supports image content — false disables the attach button */
+  queenSupportsImages: boolean;
 }
 
 function defaultAgentState(): AgentBackendState {
@@ -392,6 +246,7 @@ function defaultAgentState(): AgentBackendState {
     pendingQuestions: null,
     pendingQuestionSource: null,
     contextUsage: {},
+    queenSupportsImages: true,
   };
 }
 
@@ -578,8 +433,6 @@ export default function Workspace() {
   const [triggerScheduleSaving, setTriggerScheduleSaving] = useState(false);
   const [triggerCronSaved, setTriggerCronSaved] = useState(false);
   const [triggerTaskSaved, setTriggerTaskSaved] = useState(false);
-  const [newTabOpen, setNewTabOpen] = useState(false);
-  const newTabBtnRef = useRef<HTMLButtonElement>(null);
   const [graphPanelPct, setGraphPanelPct] = useState(30);
   const savedGraphPanelPct = useRef(30);
   const resizing = useRef(false);
@@ -731,15 +584,6 @@ export default function Workspace() {
     }
   }, [agentStates, activeWorker, updateAgentState]);
 
-  // --- Fetch discovered agents for NewTabPopover ---
-  const [discoverAgents, setDiscoverAgents] = useState<DiscoverEntry[]>([]);
-  useEffect(() => {
-    agentsApi.discover().then(result => {
-      const { Framework: _fw, ...userFacing } = result;
-      const all = Object.values(userFacing).flat();
-      setDiscoverAgents(all);
-    }).catch(() => { });
-  }, []);
 
   // --- Agent loading: loadAgentForType ---
   const loadingRef = useRef(new Set<string>());
@@ -923,6 +767,7 @@ export default function Workspace() {
           queenReady: true,
           queenPhase: qPhase,
           queenBuilding: qPhase === "building",
+          queenSupportsImages: liveSession.queen_supports_images !== false,
           // Restore flowchart overlay from persisted events
           ...(restoredFlowchartMap ? { flowchartMap: restoredFlowchartMap } : {}),
           ...(restoredOriginalDraft ? { originalDraft: restoredOriginalDraft, draftGraph: null } : {}),
@@ -1114,7 +959,7 @@ export default function Workspace() {
       // At this point liveSession is guaranteed set — if both reconnect and create
       // failed, the throw inside the catch exits the outer try block.
       const session = liveSession!;
-      const displayName = formatAgentDisplayName(session.worker_name || agentType);
+      const displayName = formatAgentDisplayName(session.graph_name || agentType);
       const initialPhase = restoredPhase || session.queen_phase || (session.has_worker ? "staging" : "planning");
       queenPhaseRef.current[agentType] = initialPhase;
       updateAgentState(agentType, {
@@ -1122,6 +967,7 @@ export default function Workspace() {
         displayName,
         queenPhase: initialPhase,
         queenBuilding: initialPhase === "building",
+        queenSupportsImages: session.queen_supports_images !== false,
         // Restore flowchart overlay from persisted events
         ...(restoredFlowchartMap ? { flowchartMap: restoredFlowchartMap } : {}),
         ...(restoredOriginalDraft ? { originalDraft: restoredOriginalDraft, draftGraph: null } : {}),
@@ -1139,7 +985,7 @@ export default function Workspace() {
             i === 0 ? {
               ...s,
               // Preserve existing label if it was already set with a #N suffix by
-              // addAgentSession/handleHistoryOpen. Only overwrite with the bare
+              // handleHistoryOpen. Only overwrite with the bare
               // displayName when the label doesn't match the resolved display name.
               label: s.label.startsWith(displayName) ? s.label : displayName,
               backendSessionId: session.session_id,
@@ -1151,7 +997,6 @@ export default function Workspace() {
       });
 
       // Restore messages when rejoining an existing session OR cold-restoring from disk.
-      let isWorkerRunning = false;
       const restoredMsgs: ChatMessage[] = [];
       // For cold-restore, use the old session ID. For live resume, use current session.
       const historyId = coldRestoreId ?? (isResumedSession ? session.session_id : undefined);
@@ -1166,17 +1011,6 @@ export default function Workspace() {
         if (restored.flowchartMap && !restoredFlowchartMap) {
           restoredFlowchartMap = restored.flowchartMap;
           restoredOriginalDraft = restored.originalDraft;
-        }
-
-        // Check worker status (needed for isWorkerRunning flag)
-        try {
-          const { sessions: workerSessions } = await sessionsApi.workerSessions(historyId);
-          const resumable = workerSessions.find(
-            (s) => s.status === "active" || s.status === "paused",
-          );
-          isWorkerRunning = resumable?.status === "active";
-        } catch {
-          // Worker session listing failed — not critical
         }
       }
 
@@ -1208,7 +1042,6 @@ export default function Workspace() {
         ready: true,
         loading: false,
         queenReady: !!(isResumedSession || hasRestoredContent),
-        ...(isWorkerRunning ? { workerRunState: "running" } : {}),
         // Restore flowchart overlay from persisted events
         ...(restoredFlowchartMap ? { flowchartMap: restoredFlowchartMap } : {}),
         ...(restoredOriginalDraft ? { originalDraft: restoredOriginalDraft, draftGraph: null } : {}),
@@ -1779,27 +1612,8 @@ export default function Workspace() {
               : null;
             if (isQueen) {
               const prompt = (event.data?.prompt as string) || "";
-              const isAutoBlock = !prompt && !options && !questions;
-              // Queen auto-block (empty prompt, no options) should not
-              // overwrite a pending worker question — the worker's
-              // QuestionWidget must stay visible.  Use the updater form
-              // to read the latest state and avoid stale-closure races
-              // when worker and queen events arrive in the same batch.
               setAgentStates(prev => {
                 const cur = prev[agentType] || defaultAgentState();
-                const workerQuestionActive = cur.pendingQuestionSource === "worker";
-                if (isAutoBlock && workerQuestionActive) {
-                  return {
-                    ...prev, [agentType]: {
-                      ...cur,
-                      awaitingInput: true,
-                      isTyping: false,
-                      isStreaming: false,
-                      queenIsTyping: false,
-                      queenBuilding: false,
-                    }
-                  };
-                }
                 return {
                   ...prev, [agentType]: {
                     ...cur,
@@ -1816,37 +1630,11 @@ export default function Workspace() {
                 };
               });
             } else {
-              // Worker input request.
-              // If the prompt is non-empty (explicit ask_user), create a visible
-              // message bubble.  For auto-block (empty prompt), the worker's text
-              // was already streamed via client_output_delta — just activate the
-              // reply box below the last worker message.
-              const eid = event.execution_id ?? "";
-              const prompt = (event.data?.prompt as string) || "";
-              if (prompt) {
-                const workerInputMsg: ChatMessage = {
-                  id: `worker-input-${eid}-${event.node_id || Date.now()}`,
-                  agent: displayName || event.node_id || "Worker",
-                  agentColor: "",
-                  content: prompt,
-                  timestamp: "",
-                  type: "worker_input_request",
-                  role: "worker",
-                  thread: agentType,
-                  createdAt: eventCreatedAt,
-                };
-                console.log('[CLIENT_INPUT_REQ] creating worker_input_request msg:', workerInputMsg.id, 'content:', prompt.slice(0, 80));
-                upsertChatMessage(agentType, workerInputMsg);
-              }
-              updateAgentState(agentType, {
-                awaitingInput: true,
-                isTyping: false,
-                isStreaming: false,
-                queenIsTyping: false,
-                pendingQuestion: prompt || null,
-                pendingOptions: options,
-                pendingQuestionSource: "worker",
-              });
+              console.warn(
+                "[CLIENT_INPUT_REQ] ignoring non-queen client_input_requested event",
+                streamId,
+                event.node_id,
+              );
             }
           }
           if (event.type === "execution_paused") {
@@ -2011,6 +1799,8 @@ export default function Workspace() {
                 role,
                 thread: agentType,
                 createdAt: eventCreatedAt,
+                nodeId: event.node_id || undefined,
+                executionId: event.execution_id || undefined,
               });
               return {
                 ...prev,
@@ -2082,6 +1872,8 @@ export default function Workspace() {
                 role,
                 thread: agentType,
                 createdAt: eventCreatedAt,
+                nodeId: event.node_id || undefined,
+                executionId: event.execution_id || undefined,
               });
               return {
                 ...prev,
@@ -2296,10 +2088,10 @@ export default function Workspace() {
           break;
         }
 
-        case "worker_loaded": {
-          const workerName = event.data?.worker_name as string | undefined;
+        case "worker_graph_loaded": {
+          const graphName = event.data?.graph_name as string | undefined;
           const agentPathFromEvent = event.data?.agent_path as string | undefined;
-          const displayName = formatAgentDisplayName(workerName || baseAgentType(agentType));
+          const displayName = formatAgentDisplayName(graphName || baseAgentType(agentType));
 
           // Invalidate cached credential requirements so the modal fetches
           // fresh data the next time it opens (the new agent may have
@@ -2609,7 +2401,7 @@ export default function Workspace() {
     });
 
   // --- handleSend ---
-  const handleSend = useCallback((text: string, thread: string) => {
+  const handleSend = useCallback((text: string, thread: string, images?: import("@/components/ChatPanel").ImageContent[]) => {
     if (!activeSession) return;
     const state = agentStates[activeWorker];
 
@@ -2632,41 +2424,6 @@ export default function Workspace() {
       return;
     }
 
-    // If worker is awaiting free-text input (no options / no QuestionWidget),
-    // route the message directly to the worker instead of the queen.
-    if (agentStates[activeWorker]?.awaitingInput && agentStates[activeWorker]?.pendingQuestionSource === "worker" && !agentStates[activeWorker]?.pendingOptions) {
-      const state = agentStates[activeWorker];
-      if (state?.sessionId && state?.ready) {
-        const userMsg: ChatMessage = {
-          id: makeId(), agent: "You", agentColor: "",
-          content: text, timestamp: "", type: "user", thread, createdAt: Date.now(),
-        };
-        setSessionsByAgent(prev => ({
-          ...prev,
-          [activeWorker]: prev[activeWorker].map(s =>
-            s.id === activeSession.id ? { ...s, messages: [...s.messages, userMsg] } : s
-          ),
-        }));
-        updateAgentState(activeWorker, { awaitingInput: false, workerInputMessageId: null, isTyping: true, pendingQuestion: null, pendingOptions: null, pendingQuestions: null, pendingQuestionSource: null });
-        executionApi.workerInput(state.sessionId, text).catch((err: unknown) => {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          const errorChatMsg: ChatMessage = {
-            id: makeId(), agent: "System", agentColor: "",
-            content: `Failed to send to worker: ${errMsg}`,
-            timestamp: "", type: "system", thread, createdAt: Date.now(),
-          };
-          setSessionsByAgent(prev => ({
-            ...prev,
-            [activeWorker]: prev[activeWorker].map(s =>
-              s.id === activeSession.id ? { ...s, messages: [...s.messages, errorChatMsg] } : s
-            ),
-          }));
-          updateAgentState(activeWorker, { isTyping: false, isStreaming: false });
-        });
-      }
-      return;
-    }
-
     // If queen has a pending question widget, dismiss it when user types directly
     if (agentStates[activeWorker]?.pendingQuestionSource === "queen") {
       updateAgentState(activeWorker, { pendingQuestion: null, pendingOptions: null, pendingQuestions: null, pendingQuestionSource: null });
@@ -2675,6 +2432,7 @@ export default function Workspace() {
     const userMsg: ChatMessage = {
       id: makeId(), agent: "You", agentColor: "",
       content: text, timestamp: "", type: "user", thread, createdAt: Date.now(),
+      images,
     };
     setSessionsByAgent(prev => ({
       ...prev,
@@ -2686,7 +2444,7 @@ export default function Workspace() {
     updateAgentState(activeWorker, { isTyping: true, queenIsTyping: true });
 
     if (state?.sessionId && state?.ready) {
-      executionApi.chat(state.sessionId, text).catch((err: unknown) => {
+      executionApi.chat(state.sessionId, text, images).catch((err: unknown) => {
         const errMsg = err instanceof Error ? err.message : String(err);
         const errorChatMsg: ChatMessage = {
           id: makeId(), agent: "System", agentColor: "",
@@ -2717,96 +2475,6 @@ export default function Workspace() {
     }
   }, [activeWorker, activeSession, agentStates, updateAgentState]);
 
-  // --- handleWorkerReply: send user input to the worker via dedicated endpoint ---
-  const handleWorkerReply = useCallback((text: string) => {
-    if (!activeSession) return;
-    const state = agentStates[activeWorker];
-    if (!state?.sessionId || !state?.ready) return;
-
-    // Add user reply to chat thread
-    const userMsg: ChatMessage = {
-      id: makeId(), agent: "You", agentColor: "",
-      content: text, timestamp: "", type: "user", thread: activeWorker, createdAt: Date.now(),
-    };
-    setSessionsByAgent(prev => ({
-      ...prev,
-      [activeWorker]: prev[activeWorker].map(s =>
-        s.id === activeSession.id ? { ...s, messages: [...s.messages, userMsg] } : s
-      ),
-    }));
-
-    // Clear awaiting state optimistically
-    updateAgentState(activeWorker, { awaitingInput: false, workerInputMessageId: null, isTyping: true, pendingQuestion: null, pendingOptions: null, pendingQuestions: null, pendingQuestionSource: null });
-
-    executionApi.workerInput(state.sessionId, text).catch((err: unknown) => {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      const errorChatMsg: ChatMessage = {
-        id: makeId(), agent: "System", agentColor: "",
-        content: `Failed to send to worker: ${errMsg}`,
-        timestamp: "", type: "system", thread: activeWorker, createdAt: Date.now(),
-      };
-      setSessionsByAgent(prev => ({
-        ...prev,
-        [activeWorker]: prev[activeWorker].map(s =>
-          s.id === activeSession.id ? { ...s, messages: [...s.messages, errorChatMsg] } : s
-        ),
-      }));
-      updateAgentState(activeWorker, { isTyping: false, isStreaming: false });
-    });
-  }, [activeWorker, activeSession, agentStates, updateAgentState]);
-
-  // --- handleWorkerQuestionAnswer: route predefined answers direct to worker, "Other" through queen ---
-  const handleWorkerQuestionAnswer = useCallback((answer: string, isOther: boolean) => {
-    if (!activeSession) return;
-    const state = agentStates[activeWorker];
-    const question = state?.pendingQuestion || "";
-    const opts = state?.pendingOptions;
-
-    if (isOther) {
-      // "Other" free-text → route through queen for evaluation
-      updateAgentState(activeWorker, { pendingQuestion: null, pendingOptions: null, pendingQuestions: null, pendingQuestionSource: null });
-      if (question && opts && state?.sessionId && state?.ready) {
-        const formatted = `[Worker asked: "${question}" | Options: ${opts.join(", ")}]\nUser answered: "${answer}"`;
-        const userMsg: ChatMessage = {
-          id: makeId(), agent: "You", agentColor: "",
-          content: answer, timestamp: "", type: "user", thread: activeWorker, createdAt: Date.now(),
-        };
-        setSessionsByAgent(prev => ({
-          ...prev,
-          [activeWorker]: prev[activeWorker].map(s =>
-            s.id === activeSession.id ? { ...s, messages: [...s.messages, userMsg] } : s
-          ),
-        }));
-        updateAgentState(activeWorker, { isTyping: true, queenIsTyping: true });
-        executionApi.chat(state.sessionId, formatted).catch((err: unknown) => {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          const errorChatMsg: ChatMessage = {
-            id: makeId(), agent: "System", agentColor: "",
-            content: `Failed to send message: ${errMsg}`,
-            timestamp: "", type: "system", thread: activeWorker, createdAt: Date.now(),
-          };
-          setSessionsByAgent(prev => ({
-            ...prev,
-            [activeWorker]: prev[activeWorker].map(s =>
-              s.id === activeSession.id ? { ...s, messages: [...s.messages, errorChatMsg] } : s
-            ),
-          }));
-          updateAgentState(activeWorker, { isTyping: false, isStreaming: false, queenIsTyping: false });
-        });
-      } else {
-        handleSend(answer, activeWorker);
-      }
-    } else {
-      // Predefined option → send directly to worker
-      handleWorkerReply(answer);
-      // Queue context for queen (fire-and-forget, no LLM response triggered)
-      if (question && state?.sessionId && state?.ready) {
-        const notification = `[Worker asked: "${question}" | User selected: "${answer}"]`;
-        executionApi.queenContext(state.sessionId, notification).catch(() => { });
-      }
-    }
-  }, [activeWorker, activeSession, agentStates, handleWorkerReply, handleSend, updateAgentState, setSessionsByAgent]);
-
   // --- handleQueenQuestionAnswer: submit queen's own question answer via /chat ---
   // The queen asked the question herself, so she already has context — just send the raw answer.
   const handleQueenQuestionAnswer = useCallback((answer: string, _isOther: boolean) => {
@@ -2828,11 +2496,9 @@ export default function Workspace() {
   }, [activeWorker, handleSend, updateAgentState]);
 
   // --- handleQuestionDismiss: user closed the question widget without answering ---
-  // Injects a dismiss signal so the blocked node can continue.
   const handleQuestionDismiss = useCallback(() => {
     const state = agentStates[activeWorker];
     if (!state?.sessionId) return;
-    const source = state.pendingQuestionSource;
     const question = state.pendingQuestion || "";
 
     // Clear UI state immediately
@@ -2844,13 +2510,8 @@ export default function Workspace() {
       awaitingInput: false,
     });
 
-    // Unblock the waiting node with a dismiss signal
     const dismissMsg = `[User dismissed the question: "${question}"]`;
-    if (source === "worker") {
-      executionApi.workerInput(state.sessionId, dismissMsg).catch(() => { });
-    } else {
-      executionApi.chat(state.sessionId, dismissMsg).catch(() => { });
-    }
+    executionApi.chat(state.sessionId, dismissMsg).catch(() => { });
   }, [agentStates, activeWorker, updateAgentState]);
 
   const handleLoadAgent = useCallback(async (agentPath: string) => {
@@ -2858,8 +2519,8 @@ export default function Workspace() {
     if (!state?.sessionId) return;
 
     try {
-      await sessionsApi.loadWorker(state.sessionId, agentPath);
-      // Success: worker_loaded SSE event will handle UI updates automatically
+      await sessionsApi.loadGraph(state.sessionId, agentPath);
+      // Success: worker_graph_loaded SSE event will handle UI updates automatically
     } catch (err) {
       // 424 = credentials required — open the credentials modal
       if (err instanceof ApiError && err.status === 424) {
@@ -2928,45 +2589,6 @@ export default function Workspace() {
       setActiveWorker(remaining[0]);
     }
   }, [sessionsByAgent, activeWorker, navigate, agentStates]);
-
-  // Open a tab for an agent type. If a tab already exists, switch to it
-  // instead of creating a duplicate — each agent gets one session.
-  // Exception: "new-agent" tabs always create a new instance since each
-  // represents a distinct conversation the user is starting from scratch.
-  const addAgentSession = useCallback((agentType: string, agentLabel?: string) => {
-    const isNewAgent = agentType === "new-agent" || agentType.startsWith("new-agent-");
-
-    if (!isNewAgent) {
-      const existingTabKey = Object.keys(sessionsByAgent).find(
-        k => baseAgentType(k) === agentType && (sessionsByAgent[k] || []).length > 0,
-      );
-      if (existingTabKey) {
-        setActiveWorker(existingTabKey);
-        const existing = sessionsByAgent[existingTabKey]?.[0];
-        if (existing) {
-          setActiveSessionByAgent(prev => ({ ...prev, [existingTabKey]: existing.id }));
-        }
-        return;
-      }
-    }
-
-    const tabKey = isNewAgent ? `new-agent-${makeId()}` : agentType;
-    const existingNewAgentCount = isNewAgent
-      ? Object.keys(sessionsByAgent).filter(
-          k => (k === "new-agent" || k.startsWith("new-agent-")) && (sessionsByAgent[k] || []).length > 0
-        ).length
-      : 0;
-    const rawLabel = agentLabel || (isNewAgent ? "New Agent" : formatAgentDisplayName(agentType));
-    const displayLabel = existingNewAgentCount === 0 ? rawLabel : `${rawLabel} #${existingNewAgentCount + 1}`;
-    const newSession = createSession(tabKey, displayLabel);
-
-    setSessionsByAgent(prev => ({
-      ...prev,
-      [tabKey]: [newSession],
-    }));
-    setActiveSessionByAgent(prev => ({ ...prev, [tabKey]: newSession.id }));
-    setActiveWorker(tabKey);
-  }, [sessionsByAgent]);
 
   // Open a history session: switch to its existing tab, or open a new tab.
   // Async so we can pre-fetch messages before creating the tab — this gives
@@ -3074,25 +2696,13 @@ export default function Workspace() {
         }}
         onCloseTab={closeAgentTab}
         afterTabs={
-          <>
-            <button
-              ref={newTabBtnRef}
-              onClick={() => setNewTabOpen(o => !o)}
-              className="flex-shrink-0 p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
-              title="Add tab"
-            >
-              <Plus className="w-3.5 h-3.5" />
-            </button>
-            <NewTabPopover
-              open={newTabOpen}
-              onClose={() => setNewTabOpen(false)}
-              anchorRef={newTabBtnRef}
-              activeWorker={activeWorker}
-              discoverAgents={discoverAgents}
-              onFromScratch={() => { addAgentSession("new-agent"); }}
-              onCloneAgent={(agentPath, agentName) => { addAgentSession(agentPath, agentName); }}
-            />
-          </>
+          <button
+            onClick={() => navigate("/")}
+            className="flex-shrink-0 p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+            title="Add tab"
+          >
+            <Plus className="w-3.5 h-3.5" />
+          </button>
         }
       >
         <button
@@ -3102,6 +2712,16 @@ export default function Workspace() {
           <KeyRound className="w-3.5 h-3.5" />
           Credentials
         </button>
+        {activeAgentState?.sessionId && (
+          <button
+            onClick={() => sessionsApi.revealFolder(activeAgentState.sessionId!).catch(() => {})}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors flex-shrink-0"
+            title="Open session data folder"
+          >
+            <FolderOpen className="w-3.5 h-3.5" />
+            Data
+          </button>
+        )}
       </TopBar>
 
       {/* Main content area */}
@@ -3212,14 +2832,11 @@ export default function Workspace() {
                 pendingQuestion={activeAgentState?.awaitingInput ? activeAgentState.pendingQuestion : null}
                 pendingOptions={activeAgentState?.awaitingInput ? activeAgentState.pendingOptions : null}
                 pendingQuestions={activeAgentState?.awaitingInput ? activeAgentState.pendingQuestions : null}
-                onQuestionSubmit={
-                  activeAgentState?.pendingQuestionSource === "queen"
-                    ? handleQueenQuestionAnswer
-                    : handleWorkerQuestionAnswer
-                }
+                onQuestionSubmit={handleQueenQuestionAnswer}
                 onMultiQuestionSubmit={handleMultiQuestionAnswer}
                 onQuestionDismiss={handleQuestionDismiss}
                 contextUsage={activeAgentState?.contextUsage}
+                supportsImages={activeAgentState?.queenSupportsImages ?? true}
               />
             )}
           </div>

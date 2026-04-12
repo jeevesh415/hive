@@ -13,6 +13,10 @@ out/
 .env
 .env.local
 .env.*.local
+.venv
+/venv
+tools/src/uv.lock
+
 
 # User configuration (copied from .example)
 config.yaml
@@ -69,11 +73,10 @@ exports/*
 
 .claude/settings.local.json
 
-.venv
-
 docs/github-issues/*
 core/tests/*dumps/*
 
 screenshots/*
 
 .gemini/*
+.coverage

@@ -2,8 +2,8 @@
 
 export interface LiveSession {
   session_id: string;
-  worker_id: string | null;
-  worker_name: string | null;
+  graph_id: string | null;
+  graph_name: string | null;
   has_worker: boolean;
   agent_path: string;
   description: string;
@@ -14,6 +14,8 @@ export interface LiveSession {
   intro_message?: string;
   /** Queen operating phase — "planning", "building", "staging", or "running" */
   queen_phase?: "planning" | "building" | "staging" | "running";
+  /** Whether the queen's LLM supports image content in messages */
+  queen_supports_images?: boolean;
   /** Present in 409 conflict responses when worker is still loading */
   loading?: boolean;
 }
@@ -77,59 +79,9 @@ export interface StopResult {
   error?: string;
 }
 
-export interface ResumeResult {
-  execution_id: string;
-  resumed_from: string;
-  checkpoint_id: string | null;
-}
-
-export interface ReplayResult {
-  execution_id: string;
-  replayed_from: string;
-  checkpoint_id: string;
-}
-
 export interface GoalProgress {
   progress: number;
   criteria: unknown[];
-}
-
-// --- Session types ---
-
-export interface SessionSummary {
-  session_id: string;
-  status?: string;
-  started_at?: string | null;
-  completed_at?: string | null;
-  steps?: number;
-  paused_at?: string | null;
-  checkpoint_count: number;
-}
-
-export interface SessionDetail {
-  status: string;
-  started_at: string;
-  completed_at: string | null;
-  input_data: Record<string, unknown>;
-  memory: Record<string, unknown>;
-  progress: {
-    current_node: string | null;
-    paused_at: string | null;
-    steps_executed: number;
-    path: string[];
-    node_visit_counts: Record<string, number>;
-    nodes_with_failures: string[];
-    resume_from?: string;
-  };
-}
-
-export interface Checkpoint {
-  checkpoint_id: string;
-  current_node: string | null;
-  next_node: string | null;
-  is_clean: boolean;
-  timestamp: string | null;
-  error?: string;
 }
 
 export interface Message {
@@ -159,6 +111,7 @@ export interface NodeSpec {
   routes: Record<string, string>;
   max_retries: number;
   max_node_visits: number;
+  /** Deprecated compatibility field; the queen is interactive by identity now. */
   client_facing: boolean;
   success_criteria: string | null;
   system_prompt: string;
@@ -328,7 +281,7 @@ export type EventTypeName =
   | "webhook_received"
   | "custom"
   | "escalation_requested"
-  | "worker_loaded"
+  | "worker_graph_loaded"
   | "credentials_required"
   | "queen_phase_changed"
   | "subagent_report"

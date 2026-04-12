@@ -36,6 +36,7 @@ async def create_queen(
     )
     from framework.agents.queen.nodes import (
         _QUEEN_BUILDING_TOOLS,
+        _QUEEN_EDITING_TOOLS,
         _QUEEN_PLANNING_TOOLS,
         _QUEEN_RUNNING_TOOLS,
         _QUEEN_STAGING_TOOLS,
@@ -44,16 +45,20 @@ async def create_queen(
         _planning_knowledge,
         _queen_behavior_always,
         _queen_behavior_building,
+        _queen_behavior_editing,
         _queen_behavior_planning,
         _queen_behavior_running,
         _queen_behavior_staging,
-        _queen_identity_building,
-        _queen_identity_planning,
-        _queen_identity_running,
-        _queen_identity_staging,
+        _queen_character_core,
+        _queen_identity_editing,
         _queen_phase_7,
+        _queen_role_building,
+        _queen_role_planning,
+        _queen_role_running,
+        _queen_role_staging,
         _queen_style,
         _queen_tools_building,
+        _queen_tools_editing,
         _queen_tools_planning,
         _queen_tools_running,
         _queen_tools_staging,
@@ -62,6 +67,7 @@ async def create_queen(
     from framework.agents.queen.nodes.thinking_hook import select_expert_persona
     from framework.graph.event_loop_node import HookContext, HookResult
     from framework.graph.executor import GraphExecutor
+    from framework.runner.mcp_registry import MCPRegistry
     from framework.runner.tool_registry import ToolRegistry
     from framework.runtime.core import Runtime
     from framework.runtime.event_bus import AgentEvent, EventType
@@ -69,7 +75,6 @@ async def create_queen(
         QueenPhaseState,
         register_queen_lifecycle_tools,
     )
-    from framework.tools.queen_memory_tools import register_queen_memory_tools
 
     hive_home = Path.home() / ".hive"
 
@@ -85,6 +90,23 @@ async def create_queen(
             logger.info("Queen: loaded MCP tools from %s", mcp_config)
         except Exception:
             logger.warning("Queen: MCP config failed to load", exc_info=True)
+
+    try:
+        registry = MCPRegistry()
+        registry.initialize()
+        if (queen_pkg_dir / "mcp_registry.json").is_file():
+            queen_registry.set_mcp_registry_agent_path(queen_pkg_dir)
+        registry_configs, selection_max_tools = registry.load_agent_selection(queen_pkg_dir)
+        if registry_configs:
+            results = queen_registry.load_registry_servers(
+                registry_configs,
+                preserve_existing_tools=True,
+                log_collisions=True,
+                max_tools=selection_max_tools,
+            )
+            logger.info("Queen: loaded MCP registry servers: %s", results)
+    except Exception:
+        logger.warning("Queen: MCP registry config failed to load", exc_info=True)
 
     # ---- Phase state --------------------------------------------------
     initial_phase = "staging" if worker_identity else "planning"
@@ -123,19 +145,14 @@ async def create_queen(
         phase_state=phase_state,
     )
 
-    # ---- Episodic memory tools (always registered) ---------------------
-    register_queen_memory_tools(queen_registry)
-
     # ---- Monitoring tools (only when worker is loaded) ----------------
-    if session.worker_runtime:
+    if session.graph_runtime:
         from framework.tools.worker_monitoring_tools import register_worker_monitoring_tools
 
         register_worker_monitoring_tools(
             queen_registry,
-            session.event_bus,
             session.worker_path,
-            stream_id="queen",
-            worker_graph_id=session.worker_runtime._graph_id,
+            worker_graph_id=session.graph_runtime._graph_id,
             default_session_id=session.id,
         )
 
@@ -147,6 +164,7 @@ async def create_queen(
     building_names = set(_QUEEN_BUILDING_TOOLS)
     staging_names = set(_QUEEN_STAGING_TOOLS)
     running_names = set(_QUEEN_RUNNING_TOOLS)
+    editing_names = set(_QUEEN_EDITING_TOOLS)
 
     registered_names = {t.name for t in queen_tools}
     missing_building = building_names - registered_names
@@ -163,11 +181,17 @@ async def create_queen(
     phase_state.building_tools = [t for t in queen_tools if t.name in building_names]
     phase_state.staging_tools = [t for t in queen_tools if t.name in staging_names]
     phase_state.running_tools = [t for t in queen_tools if t.name in running_names]
+    phase_state.editing_tools = [t for t in queen_tools if t.name in editing_names]
 
-    # ---- Cross-session memory ----------------------------------------
-    from framework.agents.queen.queen_memory import seed_if_missing
+    # ---- Global memory -------------------------------------------------
+    from framework.agents.queen.queen_memory_v2 import (
+        global_memory_dir,
+        init_memory_dir,
+    )
 
-    seed_if_missing()
+    global_dir = global_memory_dir()
+    init_memory_dir(global_dir)
+    phase_state.global_memory_dir = global_dir
 
     # ---- Compose phase-specific prompts ------------------------------
     _orig_node = _queen_graph.nodes[0]
@@ -181,7 +205,9 @@ async def create_queen(
         )
 
     _planning_body = (
-        _queen_style
+        _queen_character_core
+        + _queen_role_planning
+        + _queen_style
         + _shared_building_knowledge
         + _queen_tools_planning
         + _queen_behavior_always
@@ -189,10 +215,12 @@ async def create_queen(
         + _planning_knowledge
         + worker_identity
     )
-    phase_state.prompt_planning = _queen_identity_planning + _planning_body
+    phase_state.prompt_planning = _planning_body
 
     _building_body = (
-        _queen_style
+        _queen_character_core
+        + _queen_role_building
+        + _queen_style
         + _shared_building_knowledge
         + _queen_tools_building
         + _queen_behavior_always
@@ -202,9 +230,10 @@ async def create_queen(
         + _appendices
         + worker_identity
     )
-    phase_state.prompt_building = _queen_identity_building + _building_body
+    phase_state.prompt_building = _building_body
     phase_state.prompt_staging = (
-        _queen_identity_staging
+        _queen_character_core
+        + _queen_role_staging
         + _queen_style
         + _queen_tools_staging
         + _queen_behavior_always
@@ -212,21 +241,36 @@ async def create_queen(
         + worker_identity
     )
     phase_state.prompt_running = (
-        _queen_identity_running
+        _queen_character_core
+        + _queen_role_running
         + _queen_style
         + _queen_tools_running
         + _queen_behavior_always
         + _queen_behavior_running
         + worker_identity
     )
+    phase_state.prompt_editing = (
+        _queen_identity_editing
+        + _queen_style
+        + _queen_tools_editing
+        + _queen_behavior_always
+        + _queen_behavior_editing
+        + worker_identity
+    )
 
     # ---- Default skill protocols -------------------------------------
+    _queen_skill_dirs: list[str] = []
     try:
-        from framework.skills.manager import SkillsManager
+        from framework.skills.manager import SkillsManager, SkillsManagerConfig
 
-        _queen_skills_mgr = SkillsManager()
+        # Pass project_root so user-scope skills (~/.hive/skills/, ~/.agents/skills/)
+        # are discovered. Queen has no agent-specific project root, so we use its
+        # own directory — the value just needs to be non-None to enable user-scope scanning.
+        _queen_skills_mgr = SkillsManager(SkillsManagerConfig(project_root=Path(__file__).parent))
         _queen_skills_mgr.load()
         phase_state.protocols_prompt = _queen_skills_mgr.protocols_prompt
+        phase_state.skills_catalog_prompt = _queen_skills_mgr.skills_catalog_prompt
+        _queen_skill_dirs = _queen_skills_mgr.allowlisted_dirs
     except Exception:
         logger.debug("Queen skill loading failed (non-fatal)", exc_info=True)
 
@@ -234,19 +278,62 @@ async def create_queen(
     _session_llm = session.llm
     _session_event_bus = session.event_bus
 
+    # ---- Recall on each real user turn --------------------------------
+    async def _recall_on_user_input(event: AgentEvent) -> None:
+        """Re-select memories when real user input arrives."""
+        content = (event.data or {}).get("content", "")
+        if not content or not isinstance(content, str):
+            return
+        try:
+            from framework.agents.queen.recall_selector import (
+                format_recall_injection,
+                select_memories,
+            )
+
+            mem_dir = phase_state.global_memory_dir
+            selected = await select_memories(content, _session_llm, mem_dir)
+            phase_state._cached_global_recall_block = format_recall_injection(selected, mem_dir)
+        except Exception:
+            logger.debug("recall: user-turn cache update failed", exc_info=True)
+
+    session.event_bus.subscribe(
+        [EventType.CLIENT_INPUT_RECEIVED],
+        _recall_on_user_input,
+        filter_stream="queen",
+    )
+
     async def _persona_hook(ctx: HookContext) -> HookResult | None:
-        persona = await select_expert_persona(ctx.trigger or "", _session_llm)
-        if not persona:
+        trigger = ctx.trigger or ""
+        result = await select_expert_persona(trigger, _session_llm, memory_context="")
+        if not result:
             return None
+        # Store on phase_state so persona/style persist across dynamic prompt refreshes
+        phase_state.persona_prefix = result.persona_prefix
+        phase_state.style_directive = result.style_directive
         if _session_event_bus is not None:
             await _session_event_bus.publish(
                 AgentEvent(
                     type=EventType.QUEEN_PERSONA_SELECTED,
                     stream_id="queen",
-                    data={"persona": persona},
+                    data={"persona": result.persona_prefix},
                 )
             )
-        return HookResult(system_prompt=persona + "\n\n" + phase_state.get_current_prompt())
+
+        # Seed recall cache so the first turn has relevant memories.
+        if trigger:
+            try:
+                from framework.agents.queen.recall_selector import (
+                    format_recall_injection,
+                    select_memories,
+                )
+
+                mem_dir = phase_state.global_memory_dir
+                selected = await select_memories(trigger, _session_llm, mem_dir)
+                phase_state._cached_global_recall_block = format_recall_injection(selected, mem_dir)
+            except Exception:
+                logger.debug("recall: initial seeding failed", exc_info=True)
+
+        return HookResult(system_prompt=phase_state.get_current_prompt())
 
     # ---- Graph preparation -------------------------------------------
     initial_prompt_text = phase_state.get_current_prompt()
@@ -277,7 +364,9 @@ async def create_queen(
     queen_runtime = Runtime(hive_home / "queen")
 
     async def _queen_loop():
+        logger.debug("[_queen_loop] Starting queen loop for session %s", session.id)
         try:
+            logger.debug("[_queen_loop] Creating GraphExecutor...")
             executor = GraphExecutor(
                 runtime=queen_runtime,
                 llm=session.llm,
@@ -291,8 +380,12 @@ async def create_queen(
                 dynamic_tools_provider=phase_state.get_current_tools,
                 dynamic_prompt_provider=phase_state.get_current_prompt,
                 iteration_metadata_provider=lambda: {"phase": phase_state.phase},
+                skill_dirs=_queen_skill_dirs,
+                protocols_prompt=phase_state.protocols_prompt,
+                skills_catalog_prompt=phase_state.skills_catalog_prompt,
             )
             session.queen_executor = executor
+            logger.debug("[_queen_loop] GraphExecutor created and stored in session.queen_executor")
 
             # Wire inject_notification so phase switches notify the queen LLM
             async def _inject_phase_notification(content: str) -> None:
@@ -302,7 +395,8 @@ async def create_queen(
 
             phase_state.inject_notification = _inject_phase_notification
 
-            # Auto-switch to staging when worker execution finishes
+            # Auto-switch to editing when worker execution finishes.
+            # The worker stays loaded — queen can tweak config and re-run.
             async def _on_worker_done(event):
                 if event.stream_id == "queen":
                     return
@@ -323,21 +417,24 @@ async def create_queen(
                             "[WORKER_TERMINAL] Worker finished successfully.\n"
                             f"Output:{_out}\n"
                             "Report this to the user. "
-                            "Ask if they want to continue with another run."
+                            "Ask if they want to re-run with different input "
+                            "or tweak the configuration."
                         )
                     else:  # EXECUTION_FAILED
                         error = event.data.get("error", "Unknown error")
                         notification = (
                             "[WORKER_TERMINAL] Worker failed.\n"
                             f"Error: {error}\n"
-                            "Report this to the user and help them troubleshoot."
+                            "Report this to the user and help them troubleshoot. "
+                            "You can re-run with different input or escalate to "
+                            "building/planning if code changes are needed."
                         )
 
                     node = executor.node_registry.get("queen")
                     if node is not None and hasattr(node, "inject_event"):
                         await node.inject_event(notification)
 
-                    await phase_state.switch_to_staging(source="auto")
+                    await phase_state.switch_to_editing(source="auto")
 
             session.event_bus.subscribe(
                 event_types=[EventType.EXECUTION_COMPLETED, EventType.EXECUTION_FAILED],
@@ -345,17 +442,32 @@ async def create_queen(
             )
             session_manager._subscribe_worker_handoffs(session, executor)
 
+            # ---- Global memory reflection + recall -------------------------
+            from framework.agents.queen.reflection_agent import subscribe_reflection_triggers
+
+            _reflection_subs = await subscribe_reflection_triggers(
+                session.event_bus,
+                queen_dir,
+                session.llm,
+                memory_dir=global_dir,
+            )
+            session.memory_reflection_subs = _reflection_subs
+
             logger.info(
                 "Queen starting in %s phase with %d tools: %s",
                 phase_state.phase,
                 len(phase_state.get_current_tools()),
                 [t.name for t in phase_state.get_current_tools()],
             )
+            logger.debug("[_queen_loop] Calling executor.execute()...")
             result = await executor.execute(
                 graph=queen_graph,
                 goal=queen_goal,
                 input_data={"greeting": initial_prompt or "Session started."},
                 session_state={"resume_session_id": session.id},
+            )
+            logger.debug(
+                "[_queen_loop] executor.execute() returned with success=%s", result.success
             )
             if result.success:
                 logger.warning("Queen executor returned (should be forever-alive)")
@@ -364,9 +476,17 @@ async def create_queen(
                     "Queen executor failed: %s",
                     result.error or "(no error message)",
                 )
-        except Exception:
-            logger.error("Queen conversation crashed", exc_info=True)
+        except asyncio.CancelledError:
+            logger.info("[_queen_loop] Queen loop cancelled (normal shutdown)")
+            raise
+        except Exception as e:
+            logger.exception("[_queen_loop] Queen conversation crashed: %s", e)
+            raise
         finally:
+            logger.warning(
+                "[_queen_loop] Queen loop exiting — clearing queen_executor for session '%s'",
+                session.id,
+            )
             session.queen_executor = None
 
     return asyncio.create_task(_queen_loop())

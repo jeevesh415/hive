@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 from framework.graph.checkpoint_config import CheckpointConfig
 from framework.graph.executor import ExecutionResult, GraphExecutor
 from framework.runtime.event_bus import EventBus
-from framework.runtime.shared_state import IsolationLevel, SharedStateManager
+from framework.runtime.shared_state import IsolationLevel, SharedBufferManager
 from framework.runtime.stream_runtime import StreamRuntime, StreamRuntimeAdapter
 
 if TYPE_CHECKING:
@@ -170,7 +170,7 @@ class ExecutionStream:
         entry_spec: EntryPointSpec,
         graph: "GraphSpec",
         goal: "Goal",
-        state_manager: SharedStateManager,
+        state_manager: SharedBufferManager,
         storage: "ConcurrentStorage",
         outcome_aggregator: "OutcomeAggregator",
         event_bus: "EventBus | None" = None,
@@ -189,6 +189,9 @@ class ExecutionStream:
         skills_catalog_prompt: str = "",
         protocols_prompt: str = "",
         skill_dirs: list[str] | None = None,
+        context_warn_ratio: float | None = None,
+        batch_init_nudge: str | None = None,
+        dynamic_memory_provider_factory: Callable[[str], Callable[[], str] | None] | None = None,
     ):
         """
         Initialize execution stream.
@@ -215,6 +218,8 @@ class ExecutionStream:
             skills_catalog_prompt: Available skills catalog for system prompt
             protocols_prompt: Default skill operational protocols for system prompt
             skill_dirs: Skill base directories for Tier 3 resource access
+            context_warn_ratio: Token usage ratio to trigger DS-13 preservation warning
+            batch_init_nudge: System prompt nudge for DS-12 batch auto-detection
         """
         self.stream_id = stream_id
         self.entry_spec = entry_spec
@@ -239,6 +244,9 @@ class ExecutionStream:
         self._skills_catalog_prompt = skills_catalog_prompt
         self._protocols_prompt = protocols_prompt
         self._skill_dirs: list[str] = skill_dirs or []
+        self._context_warn_ratio: float | None = context_warn_ratio
+        self._batch_init_nudge: str | None = batch_init_nudge
+        self._dynamic_memory_provider_factory = dynamic_memory_provider_factory
 
         _es_logger = logging.getLogger(__name__)
         if protocols_prompt:
@@ -351,7 +359,7 @@ class ExecutionStream:
 
         Each entry is ``{"node_id": ..., "execution_id": ...}``.
         The currently executing node is placed first so that
-        ``inject_worker_message`` targets the active node, not a stale one.
+        ``inject_message`` targets the active node, not a stale one.
         """
         injectable: list[dict[str, str]] = []
         current_first: list[dict[str, str]] = []
@@ -433,6 +441,7 @@ class ExecutionStream:
         content: str,
         *,
         is_client_input: bool = False,
+        image_content: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Inject user input into a running client-facing EventLoopNode.
 
@@ -444,7 +453,9 @@ class ExecutionStream:
         for executor in self._active_executors.values():
             node = executor.node_registry.get(node_id)
             if node is not None and hasattr(node, "inject_event"):
-                await node.inject_event(content, is_client_input=is_client_input)
+                await node.inject_event(
+                    content, is_client_input=is_client_input, image_content=image_content
+                )
                 return True
         return False
 
@@ -541,6 +552,14 @@ class ExecutionStream:
             correlation_id = execution_id
 
         # Create execution context
+        effective_run_id = None
+        if session_state:
+            existing_run_id = session_state.get("run_id")
+            if isinstance(existing_run_id, str) and existing_run_id:
+                effective_run_id = existing_run_id
+        if effective_run_id is None:
+            effective_run_id = run_id
+
         ctx = ExecutionContext(
             id=execution_id,
             correlation_id=correlation_id,
@@ -549,7 +568,7 @@ class ExecutionStream:
             input_data=input_data,
             isolation_level=self.entry_spec.get_isolation_level(),
             session_state=session_state,
-            run_id=run_id,
+            run_id=effective_run_id,
         )
 
         async with self._lock:
@@ -630,7 +649,7 @@ class ExecutionStream:
                 self._write_run_event(execution_id, ctx.run_id, "run_started")
 
                 # Create execution-scoped memory
-                self._state_manager.create_memory(
+                self._state_manager.create_buffer(
                     execution_id=execution_id,
                     stream_id=self.stream_id,
                     isolation=ctx.isolation_level,
@@ -691,6 +710,7 @@ class ExecutionStream:
                         event_bus=self._scoped_event_bus,
                         stream_id=self.stream_id,
                         execution_id=execution_id,
+                        run_id=ctx.run_id or "",
                         storage_path=exec_storage,
                         runtime_logger=runtime_logger,
                         loop_config=self.graph.loop_config,
@@ -700,6 +720,13 @@ class ExecutionStream:
                         skills_catalog_prompt=self._skills_catalog_prompt,
                         protocols_prompt=self._protocols_prompt,
                         skill_dirs=self._skill_dirs,
+                        context_warn_ratio=self._context_warn_ratio,
+                        batch_init_nudge=self._batch_init_nudge,
+                        dynamic_memory_provider=(
+                            self._dynamic_memory_provider_factory(execution_id)
+                            if self._dynamic_memory_provider_factory is not None
+                            else None
+                        ),
                     )
                     # Track executor so inject_input() can reach EventLoopNode instances
                     self._active_executors[execution_id] = executor
@@ -958,7 +985,10 @@ class ExecutionStream:
             return
         import json as _json
 
-        session_dir = self._session_store.get_session_path(execution_id)
+        try:
+            session_dir = self._session_store.get_session_path(execution_id)
+        except ValueError:
+            return
         runs_file = session_dir / "runs.jsonl"
         now = datetime.now()
         record = {
@@ -1030,6 +1060,7 @@ class ExecutionStream:
                     agent_id=self.graph.id,
                     entry_point=self.entry_spec.id,
                 )
+                state.current_run_id = ctx.run_id
             else:
                 # Create initial state — when resuming, preserve the previous
                 # execution's progress so crashes don't lose track of state.
@@ -1060,8 +1091,9 @@ class ExecutionStream:
                         updated_at=now,
                     ),
                     progress=progress,
-                    memory=ss.get("memory", {}),
+                    data_buffer=ss.get("data_buffer", ss.get("memory", {})),
                     input_data=ctx.input_data,
+                    current_run_id=ctx.run_id,
                 )
 
             # Handle error case
@@ -1184,9 +1216,21 @@ class ExecutionStream:
             task.cancel()
             # Wait briefly for the task to finish. Don't block indefinitely —
             # the task may be stuck in a long LLM API call that doesn't
-            # respond to cancellation quickly. The cancellation is already
-            # requested; the task will clean up in the background.
+            # respond to cancellation quickly.
             done, _ = await asyncio.wait({task}, timeout=5.0)
+            if not done:
+                # Task didn't finish within timeout — clean up bookkeeping now
+                # so the session doesn't think it still has running executions.
+                # The task will continue winding down in the background and its
+                # finally block will harmlessly pop already-removed keys.
+                logger.warning(
+                    "Execution %s did not finish within cancel timeout; force-cleaning bookkeeping",
+                    execution_id,
+                )
+                async with self._lock:
+                    self._active_executions.pop(execution_id, None)
+                    self._execution_tasks.pop(execution_id, None)
+                self._active_executors.pop(execution_id, None)
             return True
         return False
 

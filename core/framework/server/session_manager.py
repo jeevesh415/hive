@@ -35,20 +35,18 @@ class Session:
     # Queen (always present once started)
     queen_executor: Any = None  # GraphExecutor for queen input injection
     queen_task: asyncio.Task | None = None
-    # Worker (optional)
-    worker_id: str | None = None
+    # Loaded graph (optional)
+    graph_id: str | None = None
     worker_path: Path | None = None
     runner: Any | None = None  # AgentRunner
-    worker_runtime: Any | None = None  # AgentRuntime
+    graph_runtime: Any | None = None  # AgentRuntime
     worker_info: Any | None = None  # AgentInfo
     # Queen phase state (building/staging/running)
     phase_state: Any = None  # QueenPhaseState
     # Worker handoff subscription
     worker_handoff_sub: str | None = None
-    # Memory consolidation subscription (fires on CONTEXT_COMPACTED)
-    memory_consolidation_sub: str | None = None
-    # Worker run digest subscription (fires on EXECUTION_COMPLETED / EXECUTION_FAILED)
-    worker_digest_sub: str | None = None
+    # Memory reflection + recall subscriptions (global memory)
+    memory_reflection_subs: list = field(default_factory=list)  # list[str]
     # Trigger definitions loaded from agent's triggers.json (available but inactive)
     available_triggers: dict[str, TriggerDefinition] = field(default_factory=dict)
     # Active trigger tracking (IDs currently firing + their asyncio tasks)
@@ -67,6 +65,8 @@ class Session:
     # directory instead of creating a new one.  This lets cold-restores accumulate
     # all messages in the original session folder so history is never fragmented.
     queen_resume_from: str | None = None
+    # Queen session directory (set during _start_queen, used for shutdown reflection)
+    queen_dir: Path | None = None
 
 
 class SessionManager:
@@ -82,6 +82,9 @@ class SessionManager:
         self._model = model
         self._credential_store = credential_store
         self._lock = asyncio.Lock()
+        # Strong references for fire-and-forget background tasks (e.g. shutdown
+        # reflections) so they aren't garbage-collected before completion.
+        self._background_tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------
     # Session lifecycle
@@ -94,10 +97,9 @@ class SessionManager:
     ) -> Session:
         """Create session infrastructure (EventBus, LLM) without starting queen.
 
-        Internal helper — use create_session() or create_session_with_worker().
+        Internal helper — use create_session() or create_session_with_worker_graph().
         """
-        from framework.config import RuntimeConfig
-        from framework.llm.litellm import LiteLLMProvider
+        from framework.config import RuntimeConfig, get_hive_config
         from framework.runtime.event_bus import EventBus
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -111,12 +113,20 @@ class SessionManager:
         rc = RuntimeConfig(model=model or self._model or RuntimeConfig().model)
 
         # Session owns these — shared with queen and worker
-        llm = LiteLLMProvider(
-            model=rc.model,
-            api_key=rc.api_key,
-            api_base=rc.api_base,
-            **rc.extra_kwargs,
-        )
+        llm_config = get_hive_config().get("llm", {})
+        if llm_config.get("use_antigravity_subscription"):
+            from framework.llm.antigravity import AntigravityProvider
+
+            llm = AntigravityProvider(model=rc.model)
+        else:
+            from framework.llm.litellm import LiteLLMProvider
+
+            llm = LiteLLMProvider(
+                model=rc.model,
+                api_key=rc.api_key,
+                api_base=rc.api_base,
+                **rc.extra_kwargs,
+            )
         event_bus = EventBus()
 
         session = Session(
@@ -159,7 +169,7 @@ class SessionManager:
         )
         return session
 
-    async def create_session_with_worker(
+    async def create_session_with_worker_graph(
         self,
         agent_path: str | Path,
         agent_id: str | None = None,
@@ -177,7 +187,7 @@ class SessionManager:
         from framework.tools.queen_lifecycle_tools import build_worker_profile
 
         agent_path = Path(agent_path)
-        resolved_worker_id = agent_id or agent_path.name
+        resolved_graph_id = agent_id or agent_path.name
 
         # When cold-restoring, check meta.json for the phase — if the agent
         # was still being built we must NOT try to load the worker (the code
@@ -212,11 +222,11 @@ class SessionManager:
         )
         session.queen_resume_from = queen_resume_from
         try:
-            # Load worker FIRST (before queen) so queen gets full tools
+            # Load the graph FIRST (before queen) so queen gets full tools
             await self._load_worker_core(
                 session,
                 agent_path,
-                worker_id=resolved_worker_id,
+                graph_id=resolved_graph_id,
                 model=model,
             )
 
@@ -225,8 +235,8 @@ class SessionManager:
 
             # Start queen with worker profile + lifecycle + monitoring tools
             worker_identity = (
-                build_worker_profile(session.worker_runtime, agent_path=agent_path)
-                if session.worker_runtime
+                build_worker_profile(session.graph_runtime, agent_path=agent_path)
+                if session.graph_runtime
                 else None
             )
             await self._start_queen(
@@ -263,10 +273,10 @@ class SessionManager:
         self,
         session: Session,
         agent_path: str | Path,
-        worker_id: str | None = None,
+        graph_id: str | None = None,
         model: str | None = None,
     ) -> None:
-        """Load a worker agent into a session (core logic).
+        """Load a graph into a session (core logic).
 
         Sets up the runner, runtime, and session fields. Does NOT notify
         the queen — callers handle that step.
@@ -274,30 +284,23 @@ class SessionManager:
         from framework.runner import AgentRunner
 
         agent_path = Path(agent_path)
-        resolved_worker_id = worker_id or agent_path.name
+        resolved_graph_id = graph_id or agent_path.name
 
-        if session.worker_runtime is not None:
-            raise ValueError(f"Session '{session.id}' already has worker '{session.worker_id}'")
+        if session.graph_runtime is not None:
+            raise ValueError(f"Session '{session.id}' already has graph '{session.graph_id}'")
 
         async with self._lock:
             if session.id in self._loading:
-                raise ValueError(f"Session '{session.id}' is currently loading a worker")
+                raise ValueError(f"Session '{session.id}' is currently loading a graph")
             self._loading.add(session.id)
 
         try:
             # Blocking I/O — load in executor
             loop = asyncio.get_running_loop()
-
-            # Prioritize: explicit model arg > worker-specific model > session default
-            from framework.config import (
-                get_preferred_worker_model,
-                get_worker_api_base,
-                get_worker_api_key,
-                get_worker_llm_extra_kwargs,
-            )
-
-            worker_model = get_preferred_worker_model()
-            resolved_model = model or worker_model or self._model
+            # By default, workers share the session's LLM with the queen so
+            # execution and memory reflection/recall stay on the same model.
+            session_model = getattr(session.llm, "model", None)
+            resolved_model = model or session_model or self._model
             runner = await loop.run_in_executor(
                 None,
                 lambda: AgentRunner.load(
@@ -309,21 +312,8 @@ class SessionManager:
                 ),
             )
 
-            # If a worker-specific model is configured, build an LLM provider
-            # with the correct worker credentials so _setup() doesn't fall back
-            # to the queen's llm config (which may be a different provider).
-            if worker_model and not model:
-                from framework.llm.litellm import LiteLLMProvider
-
-                worker_api_key = get_worker_api_key()
-                worker_api_base = get_worker_api_base()
-                worker_extra = get_worker_llm_extra_kwargs()
-                runner._llm = LiteLLMProvider(
-                    model=resolved_model,
-                    api_key=worker_api_key,
-                    api_base=worker_api_base,
-                    **worker_extra,
-                )
+            if model is None:
+                runner._llm = session.llm
 
             # Setup with session's event bus
             if runner._agent_runtime is None:
@@ -363,21 +353,18 @@ class SessionManager:
             info = runner.info()
 
             # Update session
-            session.worker_id = resolved_worker_id
+            session.graph_id = resolved_graph_id
             session.worker_path = agent_path
             session.runner = runner
-            session.worker_runtime = runtime
+            session.graph_runtime = runtime
             session.worker_info = info
-
-            # Subscribe to execution completion for per-run digest generation
-            self._subscribe_worker_digest(session)
 
             async with self._lock:
                 self._loading.discard(session.id)
 
             logger.info(
                 "Worker '%s' loaded into session '%s'",
-                resolved_worker_id,
+                resolved_graph_id,
                 session.id,
             )
 
@@ -480,10 +467,10 @@ class SessionManager:
         Called after worker loading to restart any timer/webhook triggers
         that were active before a server restart.
         """
-        if not session.available_triggers or not session.worker_runtime:
+        if not session.available_triggers or not session.graph_runtime:
             return
         try:
-            store = session.worker_runtime._session_store
+            store = session.graph_runtime._session_store
             state = await store.read_state(session_id)
             if state and state.active_triggers:
                 from framework.tools.queen_lifecycle_tools import (
@@ -519,16 +506,16 @@ class SessionManager:
         except Exception as e:
             logger.warning("Failed to restore active triggers: %s", e)
 
-    async def load_worker(
+    async def load_graph(
         self,
         session_id: str,
         agent_path: str | Path,
-        worker_id: str | None = None,
+        graph_id: str | None = None,
         model: str | None = None,
     ) -> Session:
-        """Load a worker agent into an existing session (with running queen).
+        """Load a graph into an existing session (with running queen).
 
-        Starts the worker runtime and notifies the queen.
+        Starts the graph runtime and notifies the queen.
         """
         agent_path = Path(agent_path)
 
@@ -539,13 +526,13 @@ class SessionManager:
         await self._load_worker_core(
             session,
             agent_path,
-            worker_id=worker_id,
+            graph_id=graph_id,
             model=model,
         )
 
         # Notify queen about the loaded worker (skip for queen itself).
-        if agent_path.name != "queen" and session.worker_runtime:
-            await self._notify_queen_worker_loaded(session)
+        if agent_path.name != "queen" and session.graph_runtime:
+            await self._notify_queen_graph_loaded(session)
 
         # Update meta.json so cold-restore can discover this session by agent_path
         storage_session_id = session.queen_resume_from or session.id
@@ -570,16 +557,16 @@ class SessionManager:
         await self._restore_active_triggers(session, session_id)
 
         # Emit SSE event so the frontend can update UI
-        await self._emit_worker_loaded(session)
+        await self._emit_graph_loaded(session)
 
         return session
 
-    async def unload_worker(self, session_id: str) -> bool:
+    async def unload_graph(self, session_id: str) -> bool:
         """Unload the worker from a session. Queen stays alive."""
         session = self._sessions.get(session_id)
         if session is None:
             return False
-        if session.worker_runtime is None:
+        if session.graph_runtime is None:
             return False
 
         # Cleanup worker
@@ -587,7 +574,7 @@ class SessionManager:
             try:
                 await session.runner.cleanup_async()
             except Exception as e:
-                logger.error("Error cleaning up worker '%s': %s", session.worker_id, e)
+                logger.error("Error cleaning up graph '%s': %s", session.graph_id, e)
 
         # Cancel active trigger timers
         for tid, task in session.active_timer_tasks.items():
@@ -609,24 +596,17 @@ class SessionManager:
             await self._emit_trigger_events(session, "removed", session.available_triggers)
             session.available_triggers.clear()
 
-        if session.worker_digest_sub is not None:
-            try:
-                session.event_bus.unsubscribe(session.worker_digest_sub)
-            except Exception:
-                pass
-            session.worker_digest_sub = None
-
-        worker_id = session.worker_id
-        session.worker_id = None
+        graph_id = session.graph_id
+        session.graph_id = None
         session.worker_path = None
         session.runner = None
-        session.worker_runtime = None
+        session.graph_runtime = None
         session.worker_info = None
 
         # Notify queen
         await self._notify_queen_worker_unloaded(session)
 
-        logger.info("Worker '%s' unloaded from session '%s'", worker_id, session_id)
+        logger.info("Graph '%s' unloaded from session '%s'", graph_id, session_id)
         return True
 
     # ------------------------------------------------------------------
@@ -641,11 +621,6 @@ class SessionManager:
         if session is None:
             return False
 
-        # Capture session data for memory consolidation before teardown
-        _llm = getattr(session, "llm", None)
-        _storage_id = getattr(session, "queen_resume_from", None) or session_id
-        _session_dir = Path.home() / ".hive" / "queen" / "session" / _storage_id
-
         if session.worker_handoff_sub is not None:
             try:
                 session.event_bus.unsubscribe(session.worker_handoff_sub)
@@ -653,20 +628,31 @@ class SessionManager:
                 pass
             session.worker_handoff_sub = None
 
-        if session.worker_digest_sub is not None:
+        # Stop memory reflection/recall subscriptions
+        for sub_id in session.memory_reflection_subs:
             try:
-                session.event_bus.unsubscribe(session.worker_digest_sub)
+                session.event_bus.unsubscribe(sub_id)
             except Exception:
                 pass
-            session.worker_digest_sub = None
+        session.memory_reflection_subs.clear()
 
-        # Stop queen and memory consolidation subscription
-        if session.memory_consolidation_sub is not None:
+        # Run a final shutdown reflection so recent conversation insights
+        # are persisted before the session is destroyed (fire-and-forget).
+        if session.queen_dir is not None:
             try:
-                session.event_bus.unsubscribe(session.memory_consolidation_sub)
+                from framework.agents.queen.reflection_agent import run_shutdown_reflection
+
+                task = asyncio.create_task(
+                    asyncio.shield(run_shutdown_reflection(session.queen_dir, session.llm)),
+                )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+                logger.info("Session '%s': shutdown reflection spawned", session_id)
             except Exception:
-                pass
-            session.memory_consolidation_sub = None
+                logger.warning(
+                    "Session '%s': failed to spawn shutdown reflection", session_id, exc_info=True
+                )
+
         if session.queen_task is not None:
             session.queen_task.cancel()
             session.queen_task = None
@@ -697,17 +683,6 @@ class SessionManager:
                 await session.runner.cleanup_async()
             except Exception as e:
                 logger.error("Error cleaning up worker: %s", e)
-
-        # Final memory consolidation — fire-and-forget so teardown isn't blocked.
-        if _llm is not None and _session_dir.exists():
-            import asyncio
-
-            from framework.agents.queen.queen_memory import consolidate_queen_memory
-
-            asyncio.create_task(
-                consolidate_queen_memory(session_id, _session_dir, _llm),
-                name=f"queen-memory-consolidation-{session_id}",
-            )
 
         # Close per-session event log
         session.event_bus.close_session_log()
@@ -744,135 +719,6 @@ class SessionManager:
         else:
             logger.warning("Worker handoff received but queen node not ready")
 
-    def _subscribe_worker_digest(self, session: Session) -> None:
-        """Subscribe to worker events to write per-run digests.
-
-        Three triggers:
-        - NODE_LOOP_ITERATION: write a mid-run snapshot, throttled to at most
-          once every _DIGEST_COOLDOWN seconds per execution.
-        - TOOL_CALL_COMPLETED for delegate_to_sub_agent: same throttled snapshot.
-          Orchestrator nodes often run all subagent calls in a single LLM turn,
-          so NODE_LOOP_ITERATION only fires once at the end.  Subagent
-          completions provide intermediate checkpoints.
-        - EXECUTION_COMPLETED / EXECUTION_FAILED: always write the final digest,
-          bypassing the cooldown.
-        """
-        import time as _time
-
-        from framework.runtime.event_bus import EventType as _ET
-
-        _DIGEST_COOLDOWN = 300.0  # seconds between mid-run snapshots
-
-        if session.worker_digest_sub is not None:
-            try:
-                session.event_bus.unsubscribe(session.worker_digest_sub)
-            except Exception:
-                pass
-            session.worker_digest_sub = None
-
-        agent_name = session.worker_path.name if session.worker_path else None
-        if not agent_name:
-            return
-
-        _agent_name = agent_name
-        _llm = session.llm
-        _bus = session.event_bus
-        # per-execution_id monotonic timestamp of last mid-run digest
-        _last_digest: dict[str, float] = {}
-
-        def _resolve_run_id(exec_id: str) -> str | None:
-            """Look up the run_id for a given execution_id via EXECUTION_STARTED history."""
-            for e in _bus.get_history(event_type=_ET.EXECUTION_STARTED, limit=200):
-                if e.execution_id == exec_id and getattr(e, "run_id", None):
-                    return e.run_id
-            return None
-
-        async def _inject_digest_to_queen(run_id: str) -> None:
-            """Read the written digest and push it into the queen's conversation."""
-            from framework.agents.worker_memory import digest_path
-
-            try:
-                content = digest_path(_agent_name, run_id).read_text(encoding="utf-8").strip()
-            except OSError:
-                return
-            if not content:
-                return
-            executor = session.queen_executor
-            if executor is None:
-                return
-            node = executor.node_registry.get("queen")
-            if node is None or not hasattr(node, "inject_event"):
-                return
-            await node.inject_event(f"[WORKER_DIGEST]\n{content}")
-
-        async def _consolidate_and_notify(run_id: str, outcome_event: Any) -> None:
-            """Write the digest then push it to the queen."""
-            from framework.agents.worker_memory import consolidate_worker_run
-
-            await consolidate_worker_run(_agent_name, run_id, outcome_event, _bus, _llm)
-            await _inject_digest_to_queen(run_id)
-
-        async def _on_worker_event(event: Any) -> None:
-            if event.stream_id == "queen":
-                return
-
-            exec_id = event.execution_id
-
-            if event.type == _ET.EXECUTION_STARTED:
-                # New run on this execution_id — start the cooldown timer so
-                # mid-run snapshots don't fire immediately at session start.
-                # The first snapshot will happen after _DIGEST_COOLDOWN seconds.
-                if exec_id:
-                    _last_digest[exec_id] = _time.monotonic()
-
-            elif event.type in (
-                _ET.EXECUTION_COMPLETED,
-                _ET.EXECUTION_FAILED,
-                _ET.EXECUTION_PAUSED,
-            ):
-                # Final digest — always fire, ignore cooldown.
-                # EXECUTION_PAUSED covers cancellation (queen re-triggering the
-                # worker cancels the previous execution, emitting paused).
-                run_id = getattr(event, "run_id", None) or _resolve_run_id(exec_id)
-                if run_id:
-                    asyncio.create_task(
-                        _consolidate_and_notify(run_id, event),
-                        name=f"worker-digest-final-{run_id}",
-                    )
-
-            elif event.type in (_ET.NODE_LOOP_ITERATION, _ET.TOOL_CALL_COMPLETED):
-                # Mid-run snapshot — respect 300 s cooldown per execution.
-                # TOOL_CALL_COMPLETED is only interesting for subagent calls;
-                # regular tool completions are too frequent and too cheap.
-                if event.type == _ET.TOOL_CALL_COMPLETED:
-                    tool_name = (event.data or {}).get("tool_name", "")
-                    if tool_name != "delegate_to_sub_agent":
-                        return
-                if not exec_id:
-                    return
-                now = _time.monotonic()
-                if now - _last_digest.get(exec_id, 0.0) < _DIGEST_COOLDOWN:
-                    return
-                run_id = _resolve_run_id(exec_id)
-                if run_id:
-                    _last_digest[exec_id] = now
-                    asyncio.create_task(
-                        _consolidate_and_notify(run_id, None),
-                        name=f"worker-digest-{run_id}",
-                    )
-
-        session.worker_digest_sub = session.event_bus.subscribe(
-            event_types=[
-                _ET.EXECUTION_STARTED,
-                _ET.NODE_LOOP_ITERATION,
-                _ET.TOOL_CALL_COMPLETED,
-                _ET.EXECUTION_COMPLETED,
-                _ET.EXECUTION_FAILED,
-                _ET.EXECUTION_PAUSED,
-            ],
-            handler=_on_worker_event,
-        )
-
     def _subscribe_worker_handoffs(self, session: Session, executor: Any) -> None:
         """Subscribe queen to worker/subagent escalation handoff events."""
         from framework.runtime.event_bus import EventType as _ET
@@ -903,6 +749,12 @@ class SessionManager:
         """
         from framework.server.queen_orchestrator import create_queen
 
+        logger.debug(
+            "[_start_queen] Starting for session %s, current queen_executor=%s",
+            session.id,
+            session.queen_executor,
+        )
+
         hive_home = Path.home() / ".hive"
 
         # Determine which session directory to use for queen storage.
@@ -911,6 +763,7 @@ class SessionManager:
         storage_session_id = session.queen_resume_from or session.id
         queen_dir = hive_home / "queen" / "session" / storage_session_id
         queen_dir.mkdir(parents=True, exist_ok=True)
+        session.queen_dir = queen_dir
 
         # Always write/update session metadata so history sidebar has correct
         # agent name, path, and last-active timestamp (important so the original
@@ -986,6 +839,7 @@ class SessionManager:
             pass
         session.event_bus.set_session_log(events_path, iteration_offset=iteration_offset)
 
+        logger.debug("[_start_queen] Calling create_queen...")
         session.queen_task = await create_queen(
             session=session,
             session_manager=self,
@@ -993,10 +847,15 @@ class SessionManager:
             queen_dir=queen_dir,
             initial_prompt=initial_prompt,
         )
+        logger.debug(
+            "[_start_queen] create_queen returned, queen_task=%s, queen_executor=%s",
+            session.queen_task,
+            session.queen_executor,
+        )
 
         # Auto-load worker on cold restore — the queen's conversation expects
         # the agent to be loaded, but the new session has no worker.
-        if session.queen_resume_from and not session.worker_runtime:
+        if session.queen_resume_from and not session.graph_runtime:
             meta_path = queen_dir / "meta.json"
             if meta_path.exists():
                 try:
@@ -1007,7 +866,7 @@ class SessionManager:
                     if _agent_path and Path(_agent_path).exists():
                         if _phase in ("staging", "running", None):
                             # Agent fully built — load worker and resume
-                            await self.load_worker(session.id, _agent_path)
+                            await self.load_graph(session.id, _agent_path)
                             if session.phase_state:
                                 await session.phase_state.switch_to_staging(source="auto")
                             # Emit flowchart overlay so frontend can display it
@@ -1026,31 +885,12 @@ class SessionManager:
                 except Exception:
                     logger.warning("Cold restore: failed to auto-load worker", exc_info=True)
 
-        # Memory consolidation — triggered by context compaction events.
-        # Compaction is a natural signal that "enough has happened to be worth remembering".
-        _consolidation_llm = session.llm
-        _consolidation_session_dir = queen_dir
-
-        async def _on_compaction(_event) -> None:
-            from framework.agents.queen.queen_memory import consolidate_queen_memory
-
-            await consolidate_queen_memory(
-                session.id, _consolidation_session_dir, _consolidation_llm
-            )
-
-        from framework.runtime.event_bus import EventType as _ET
-
-        session.memory_consolidation_sub = session.event_bus.subscribe(
-            event_types=[_ET.CONTEXT_COMPACTED],
-            handler=_on_compaction,
-        )
-
     # ------------------------------------------------------------------
     # Queen notifications
     # ------------------------------------------------------------------
 
-    async def _notify_queen_worker_loaded(self, session: Session) -> None:
-        """Inject a system message into the queen about the loaded worker."""
+    async def _notify_queen_graph_loaded(self, session: Session) -> None:
+        """Inject a system message into the queen about the loaded graph."""
         from framework.tools.queen_lifecycle_tools import build_worker_profile
 
         executor = session.queen_executor
@@ -1060,7 +900,7 @@ class SessionManager:
         if node is None or not hasattr(node, "inject_event"):
             return
 
-        profile = build_worker_profile(session.worker_runtime, agent_path=session.worker_path)
+        profile = build_worker_profile(session.graph_runtime, agent_path=session.worker_path)
 
         # Append available trigger info so the queen knows what's schedulable
         trigger_lines = ""
@@ -1076,20 +916,20 @@ class SessionManager:
                 + "\n".join(parts)
             )
 
-        await node.inject_event(f"[SYSTEM] Worker loaded.{profile}{trigger_lines}")
+        await node.inject_event(f"[SYSTEM] Graph loaded.{profile}{trigger_lines}")
 
-    async def _emit_worker_loaded(self, session: Session) -> None:
-        """Publish a WORKER_LOADED event so the frontend can update."""
+    async def _emit_graph_loaded(self, session: Session) -> None:
+        """Publish a WORKER_GRAPH_LOADED event so the frontend can update."""
         from framework.runtime.event_bus import AgentEvent, EventType
 
         info = session.worker_info
         await session.event_bus.publish(
             AgentEvent(
-                type=EventType.WORKER_LOADED,
+                type=EventType.WORKER_GRAPH_LOADED,
                 stream_id="queen",
                 data={
-                    "worker_id": session.worker_id,
-                    "worker_name": info.name if info else session.worker_id,
+                    "graph_id": session.graph_id,
+                    "graph_name": info.name if info else session.graph_id,
                     "agent_path": str(session.worker_path) if session.worker_path else "",
                     "goal": info.goal_name if info else "",
                     "node_count": info.node_count if info else 0,
@@ -1166,26 +1006,36 @@ class SessionManager:
                 )
             )
 
-    async def revive_queen(self, session: Session, initial_prompt: str | None = None) -> None:
+    async def revive_queen(self, session: Session) -> None:
         """Revive a dead queen executor on an existing session.
 
         Restarts the queen with the same session context (worker profile, tools, etc.).
         """
         from framework.tools.queen_lifecycle_tools import build_worker_profile
 
+        logger.debug(
+            "[revive_queen] Starting revival for session '%s', current queen_executor=%s",
+            session.id,
+            session.queen_executor,
+        )
+
         # Build worker identity if worker is loaded
         worker_identity = (
-            build_worker_profile(session.worker_runtime, agent_path=session.worker_path)
-            if session.worker_runtime
+            build_worker_profile(session.graph_runtime, agent_path=session.worker_path)
+            if session.graph_runtime
             else None
         )
+        logger.debug("[revive_queen] worker_identity=%s", "present" if worker_identity else "None")
 
         # Start queen with existing session context
-        await self._start_queen(
-            session, worker_identity=worker_identity, initial_prompt=initial_prompt
-        )
+        logger.debug("[revive_queen] Calling _start_queen...")
+        await self._start_queen(session, worker_identity=worker_identity)
 
-        logger.info("Queen revived for session '%s'", session.id)
+        logger.info(
+            "Queen revived for session '%s', new queen_executor=%s",
+            session.id,
+            session.queen_executor,
+        )
 
     # ------------------------------------------------------------------
     # Lookups
@@ -1194,22 +1044,22 @@ class SessionManager:
     def get_session(self, session_id: str) -> Session | None:
         return self._sessions.get(session_id)
 
-    def get_session_by_worker_id(self, worker_id: str) -> Session | None:
-        """Find a session by its loaded worker's ID."""
+    def get_session_by_graph_id(self, graph_id: str) -> Session | None:
+        """Find a session by its loaded graph's ID."""
         for s in self._sessions.values():
-            if s.worker_id == worker_id:
+            if s.graph_id == graph_id:
                 return s
         return None
 
     def get_session_for_agent(self, agent_id: str) -> Session | None:
         """Resolve an agent_id to a session (backward compat).
 
-        Checks session.id first, then session.worker_id.
+        Checks session.id first, then session.graph_id.
         """
         s = self._sessions.get(agent_id)
         if s:
             return s
-        return self.get_session_by_worker_id(agent_id)
+        return self.get_session_by_graph_id(agent_id)
 
     def is_loading(self, session_id: str) -> bool:
         return session_id in self._loading

@@ -6,7 +6,6 @@ Usage:
     hive info exports/my-agent
     hive validate exports/my-agent
     hive list exports/
-    hive dispatch exports/ --input '{"key": "value"}'
     hive shell exports/my-agent
 
 Testing commands:
@@ -79,7 +78,7 @@ def main():
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # Register runner commands (run, info, validate, list, dispatch, shell)
+    # Register runner commands (run, info, validate, list, shell)
     from framework.runner.cli import register_commands
 
     register_commands(subparsers)
@@ -98,6 +97,11 @@ def main():
     from framework.debugger.cli import register_debugger_commands
 
     register_debugger_commands(subparsers)
+
+    # Register MCP registry commands (mcp install, mcp add, ...)
+    from framework.runner.mcp_registry_cli import register_mcp_commands
+
+    register_mcp_commands(subparsers)
 
     args = parser.parse_args()
 
